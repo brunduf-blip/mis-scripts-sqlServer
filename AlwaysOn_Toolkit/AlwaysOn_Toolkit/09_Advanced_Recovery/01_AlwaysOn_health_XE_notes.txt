@@ -1,0 +1,4 @@
+# AlwaysOn_health (Extended Events)
+- En muchas versiones existe la sesión 'AlwaysOn_health'.
+- Permite ver eventos relevantes de HADR (disconnects, errors, suspend, etc.).
+- Si necesitás, agregá un script específico para leer sys.fn_xe_file_target_read_file.

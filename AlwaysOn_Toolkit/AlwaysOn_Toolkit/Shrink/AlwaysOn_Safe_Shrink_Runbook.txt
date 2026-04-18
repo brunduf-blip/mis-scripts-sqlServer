@@ -1,0 +1,192 @@
+ALWAYS ON / STANDALONE – SAFE SHRINK RUNBOOK
+
+============================================================
+OBJETIVO
+============================================================
+Realizar un SHRINK controlado y seguro del archivo de LOG
+(o DATA si aplica), evitando:
+- Crecimiento inmediato posterior
+- Ruptura de cadena de backups
+- Problemas en Always On
+- Bloqueos innecesarios
+
+============================================================
+PASO 1 – IDENTIFICAR TIPO DE ENTORNO
+============================================================
+1) ¿La base está en Always On?
+   SELECT name
+   FROM sys.availability_databases_cluster
+   WHERE database_name = 'NOMBRE_DB';
+
+   Si devuelve fila → Está en AG.
+   Si no devuelve → Es standalone.
+
+============================================================
+PASO 2 – VER ESTADO DE SINCRONIZACIÓN (SI ES AG)
+============================================================
+(Ejecutar en ambas réplicas)
+
+SELECT
+    DB_NAME(database_id) AS DB,
+    synchronization_state_desc,
+    synchronization_health_desc,
+    is_suspended,
+    suspend_reason_desc
+FROM sys.dm_hadr_database_replica_states
+WHERE database_id = DB_ID('NOMBRE_DB');
+
+Requisito para shrink en AG:
+- synchronization_state_desc = SYNCHRONIZED
+- is_suspended = 0
+
+Si no está sincronizada → NO hacer shrink aún.
+
+============================================================
+PASO 3 – VER POR QUÉ NO TRUNCA EL LOG
+============================================================
+SELECT name, recovery_model_desc, log_reuse_wait_desc
+FROM sys.databases
+WHERE name = 'NOMBRE_DB';
+
+Interpretación rápida:
+- LOG_BACKUP            → Falta BACKUP LOG
+- AVAILABILITY_REPLICA  → Secundario atrasado (no trunca hasta ponerse al día)
+- ACTIVE_TRANSACTION    → Transacción larga abierta
+- OLDEST_PAGE           → Forzar CHECKPOINT (ver Paso 4b)
+- NOTHING               → Se puede truncar (si hay log backups, debería liberar)
+
+============================================================
+PASO 4 – HACER TRUNCAMIENTO “SANO” (LOG) ANTES DEL SHRINK
+============================================================
+IMPORTANTE:
+- En FULL/BULK_LOGGED, el shrink NO libera log por sí solo.
+- Primero hay que TRUNCAR mediante BACKUP LOG (o resolver el reuse_wait).
+
+4a) Si log_reuse_wait_desc = LOG_BACKUP, ejecutar:
+BACKUP LOG [NOMBRE_DB]
+TO DISK = 'RUTA_BACKUP.trn'
+WITH INIT, COMPRESSION;
+
+Luego re-chequear:
+SELECT name, log_reuse_wait_desc
+FROM sys.databases
+WHERE name='NOMBRE_DB';
+
+4b) Si log_reuse_wait_desc = OLDEST_PAGE, ejecutar:
+USE [NOMBRE_DB];
+CHECKPOINT;
+
+Y re-chequear log_reuse_wait_desc.
+
+============================================================
+PASO 5 – VER USO REAL DEL LOG (SI VALE LA PENA SHRINKEAR)
+============================================================
+DBCC SQLPERF(LOGSPACE);
+
+Mirar la fila de NOMBRE_DB:
+- Si % Log Used es bajo (ej: < 20%), el shrink tendrá efecto.
+- Si % Log Used es alto, el shrink no va a bajar (hay log activo).
+
+============================================================
+PASO 6 – VALIDAR ARCHIVOS Y CRECIMIENTO (MUY IMPORTANTE)
+============================================================
+SELECT
+    name,
+    type_desc,
+    size/128.0 AS size_mb,
+    growth,
+    is_percent_growth
+FROM sys.master_files
+WHERE database_id = DB_ID('NOMBRE_DB');
+
+RECOMENDACIÓN:
+- Evitar growth en porcentaje (is_percent_growth = 1), sobre todo con logs grandes.
+- Pasar a growth fijo en MB.
+
+============================================================
+PASO 7 – AJUSTAR AUTOGROWTH ANTES DEL SHRINK (PREVENCIÓN)
+============================================================
+Ejecutar (idealmente en PRIMARIO si es AG; y luego replicar ajuste al secundario):
+ALTER DATABASE [NOMBRE_DB]
+MODIFY FILE ( NAME = N'log', FILEGROWTH = 4096MB );   -- 4GB fijo (ajustar estándar)
+
+Opciones típicas:
+- 1024MB  (1GB)  ambientes chicos
+- 4096MB  (4GB)  estándar medio
+- 8192MB  (8GB)  bases con mucho log
+
+============================================================
+PASO 8 – EJECUTAR SHRINK CONTROLADO
+============================================================
+NOTA:
+- Shrink de LOG solo si hay un motivo (incidente/espacio) y luego se deja tamaño operativo.
+- No ejecutar shrink repetidamente (fragmenta y vuelve a crecer).
+
+USE [NOMBRE_DB];
+
+-- Ejemplo: dejar LOG en 64 GB
+DBCC SHRINKFILE (N'log', 65536);   -- MB (65536 MB = 64 GB)
+
+Otros ejemplos:
+- 128 GB → 131072
+- 256 GB → 262144
+
+============================================================
+PASO 9 – VERIFICACIÓN POST-SHRINK
+============================================================
+9a) Validar tamaño y growth:
+SELECT
+    name, type_desc, size/128.0 AS size_mb, growth, is_percent_growth
+FROM sys.master_files
+WHERE database_id = DB_ID('NOMBRE_DB');
+
+9b) Validar log_reuse_wait_desc:
+SELECT name, log_reuse_wait_desc
+FROM sys.databases
+WHERE name='NOMBRE_DB';
+
+9c) Si es Always On, validar sincronización (en ambas réplicas):
+SELECT
+    DB_NAME(database_id) AS DB,
+    synchronization_state_desc,
+    synchronization_health_desc,
+    is_suspended,
+    suspend_reason_desc,
+    redo_queue_size,
+    log_send_queue_size
+FROM sys.dm_hadr_database_replica_states
+WHERE database_id = DB_ID('NOMBRE_DB');
+
+============================================================
+ESCENARIOS ESPECIALES / DECISIONES
+============================================================
+A) ALWAYS ON
+- Ejecutar shrink en el PRIMARIO.
+- Asegurar que el secundario esté al día (SYNCHRONIZED).
+- Si el secundario está atrasado (AVAILABILITY_REPLICA), NO vas a truncar log bien.
+- Monitorear redo_queue_size hasta que baje.
+
+B) STANDALONE
+- Confirmar que no haya transacción larga:
+  DBCC OPENTRAN('NOMBRE_DB');
+- Confirmar que hay backups de log (si FULL).
+
+C) ¿CUÁNDO NO HACER SHRINK?
+- Si el log crece por carga normal (mejor dimensionar).
+- Si no resolviste la causa (retención, jobs, transacciones, AlwaysOn atrasado).
+- Si pretendés “mantenerlo chico siempre” (va a crecer igual y fragmentar).
+
+============================================================
+CHECKLIST RÁPIDO
+============================================================
+☐ Confirmé si está en AG (sys.availability_databases_cluster)
+☐ Si es AG, confirmé SYNCHRONIZED + no suspendida
+☐ Revisé log_reuse_wait_desc
+☐ Ejecuté BACKUP LOG (si correspondía)
+☐ (Si OLDEST_PAGE) ejecuté CHECKPOINT
+☐ Revisé % Log Used (DBCC SQLPERF(LOGSPACE))
+☐ Ajusté FILEGROWTH a MB fijo
+☐ Shrink a tamaño razonable (no mínimo)
+☐ Validé estado final y colas redo/log_send (si es AG)
+
+FIN

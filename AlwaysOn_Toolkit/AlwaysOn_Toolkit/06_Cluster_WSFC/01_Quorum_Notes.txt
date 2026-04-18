@@ -1,0 +1,4 @@
+# Notas WSFC (manual)
+- Revisar Failover Cluster Manager: quorum, nodes up/down, networks, roles.
+- Event Viewer: System + FailoverClustering logs.
+- Validar DNS/AD para listener si hay reconexiones lentas.
